@@ -649,21 +649,42 @@ async def page_index(request: Request):
 async def route_health(request: Request):
     """Reports overall health for the Railway healthcheck.
 
-    Returns 503 when the gateway is in a non-running state so Railway's
-    healthcheck timeout (configured in railway.toml) eventually triggers
-    a redeploy/restart of the whole container — our last-resort recovery
-    when the in-process watchdog (Gateway._drain) has given up.
+    Healthy (HTTP 200) — the container itself is fine and Railway must NOT
+    recreate it:
+      - "running"               — gateway is up.
+      - "starting" / "stopping" — transient lifecycle states (<30s during
+        reconfig); Railway's healthcheckTimeout already absorbs these.
+      - "stopped"               — gateway is intentionally not running.
+        This covers two important cases:
+          (a) Fresh deploy where the user hasn't filled in provider+model
+              yet — `auto_start()` skips `gw.start()` and state stays
+              "stopped". The dashboard is the way out, and we can't reach
+              the dashboard if Railway keeps killing the container.
+          (b) Admin paused the gateway from the UI on purpose.
+      - "error" with circuit breaker NOT tripped — the watchdog
+        (`_watchdog_respawn`) is still in the middle of its retry budget;
+        let it do its job before escalating.
 
-    States other than "running" we treat as unhealthy:
-      - "stopped" / "stopping" — admin paused the gateway; brief blips
-        during reconfig are absorbed by Railway's healthcheckTimeout.
-      - "starting"             — typically <30s; same absorption applies.
-      - "error"                — watchdog tripped its circuit breaker;
-        we WANT Railway to recreate the container in this case.
+    Unhealthy (HTTP 503) — last-resort signal asking Railway to recreate
+    the container:
+      - "error" with circuit breaker tripped — the watchdog gave up after
+        repeated crashes within the window. A fresh container is our only
+        remaining recovery path.
     """
-    status_code = 200 if gw.state == "running" else 503
-    return JSONResponse({"status": "ok" if status_code == 200 else "degraded",
-                         "gateway": gw.state}, status_code=status_code)
+    snapshot = gw.status()
+    state = snapshot["state"]
+    circuit_open = snapshot.get("circuit_open", False)
+
+    unhealthy = (state == "error" and circuit_open)
+    status_code = 503 if unhealthy else 200
+    return JSONResponse(
+        {
+            "status":  "degraded" if unhealthy else "ok",
+            "gateway": state,
+            "circuit_open": circuit_open,
+        },
+        status_code=status_code,
+    )
 
 
 async def api_config_get(request: Request):
