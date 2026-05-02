@@ -416,12 +416,24 @@ async def logout(request: Request) -> Response:
 
 # ── Gateway manager ───────────────────────────────────────────────────────────
 class Gateway:
+    # Circuit-breaker config: if more than _max_restart_attempts auto-restarts
+    # happen within _restart_window seconds, stop trying — we're in a crash
+    # loop and need help from outside (Railway healthcheck via /health 503
+    # will recreate the whole container, see route_health).
+    _max_restart_attempts = 5
+    _restart_window = 600  # 10 minutes
+    _restart_backoff = 5   # seconds between gateway exit and respawn
+
     def __init__(self):
         self.proc: asyncio.subprocess.Process | None = None
         self.state = "stopped"
         self.logs: deque[str] = deque(maxlen=500)
         self.started_at: float | None = None
         self.restarts = 0
+        # Sliding window of auto-restart timestamps used by the circuit breaker.
+        # User-initiated restarts via the admin API don't push here — they're
+        # presumed intentional and shouldn't trip the breaker.
+        self._auto_restart_history: deque[float] = deque(maxlen=self._max_restart_attempts + 1)
 
     async def start(self):
         if self.proc and self.proc.returncode is None:
@@ -475,17 +487,65 @@ class Gateway:
         async for raw in self.proc.stdout:
             line = ANSI_ESCAPE.sub("", raw.decode(errors="replace").rstrip())
             self.logs.append(line)
+        # Subprocess exited. If we were "running" (not user-stopped) it crashed.
         if self.state == "running":
+            exit_code = self.proc.returncode
             self.state = "error"
-            self.logs.append(f"[error] Gateway exited (code {self.proc.returncode})")
+            self.logs.append(f"[error] Gateway exited (code {exit_code})")
+            asyncio.create_task(self._watchdog_respawn(exit_code))
+
+    async def _watchdog_respawn(self, exit_code: int | None) -> None:
+        """Auto-restart the gateway after an unexpected exit, with a circuit breaker.
+
+        Workflow:
+          1. Drop restart timestamps older than _restart_window from the history.
+          2. If we've already done _max_restart_attempts within the window,
+             give up — leave state="error" so Railway's healthcheck on /health
+             returns 503 and the container gets recreated.
+          3. Otherwise: sleep _restart_backoff seconds, push a fresh timestamp,
+             call start(). If the user (or any other code path) calls start()
+             concurrently, start()'s own idempotency guard handles it.
+
+        We deliberately do NOT call self.restart() here, because that increments
+        self.restarts and goes through stop()→start()  — but the proc is already
+        dead, so stop() is a no-op and the counter would conflate intentional
+        restarts with crash recoveries.
+        """
+        now = time.time()
+        # Trim old entries
+        cutoff = now - self._restart_window
+        while self._auto_restart_history and self._auto_restart_history[0] < cutoff:
+            self._auto_restart_history.popleft()
+
+        if len(self._auto_restart_history) >= self._max_restart_attempts:
+            self.logs.append(
+                f"[watchdog] Circuit breaker tripped: {len(self._auto_restart_history)} "
+                f"auto-restarts in last {self._restart_window}s — giving up. "
+                f"Railway healthcheck will recreate the container."
+            )
+            return
+
+        attempt = len(self._auto_restart_history) + 1
+        self.logs.append(
+            f"[watchdog] Gateway crashed (exit={exit_code}); "
+            f"auto-restart attempt {attempt}/{self._max_restart_attempts} in {self._restart_backoff}s"
+        )
+        await asyncio.sleep(self._restart_backoff)
+        self._auto_restart_history.append(time.time())
+        await self.start()
 
     def status(self) -> dict:
         uptime = int(time.time() - self.started_at) if self.started_at and self.state == "running" else None
+        # Trim auto-restart history to the active window for the status snapshot
+        cutoff = time.time() - self._restart_window
+        recent_auto = sum(1 for ts in self._auto_restart_history if ts >= cutoff)
         return {
-            "state":    self.state,
-            "pid":      self.proc.pid if self.proc and self.proc.returncode is None else None,
-            "uptime":   uptime,
-            "restarts": self.restarts,
+            "state":         self.state,
+            "pid":           self.proc.pid if self.proc and self.proc.returncode is None else None,
+            "uptime":        uptime,
+            "restarts":      self.restarts,
+            "auto_restarts": recent_auto,
+            "circuit_open":  recent_auto >= self._max_restart_attempts,
         }
 
 
@@ -587,7 +647,23 @@ async def page_index(request: Request):
 
 
 async def route_health(request: Request):
-    return JSONResponse({"status": "ok", "gateway": gw.state})
+    """Reports overall health for the Railway healthcheck.
+
+    Returns 503 when the gateway is in a non-running state so Railway's
+    healthcheck timeout (configured in railway.toml) eventually triggers
+    a redeploy/restart of the whole container — our last-resort recovery
+    when the in-process watchdog (Gateway._drain) has given up.
+
+    States other than "running" we treat as unhealthy:
+      - "stopped" / "stopping" — admin paused the gateway; brief blips
+        during reconfig are absorbed by Railway's healthcheckTimeout.
+      - "starting"             — typically <30s; same absorption applies.
+      - "error"                — watchdog tripped its circuit breaker;
+        we WANT Railway to recreate the container in this case.
+    """
+    status_code = 200 if gw.state == "running" else 503
+    return JSONResponse({"status": "ok" if status_code == 200 else "degraded",
+                         "gateway": gw.state}, status_code=status_code)
 
 
 async def api_config_get(request: Request):
